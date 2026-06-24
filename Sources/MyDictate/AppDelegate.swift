@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var state: State = .idle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Vocabulary.normalizeStored() // частые слова: построчное → через «, »
         setupStatusItem()
 
         TriggerMonitor.shared.onTrigger = { [weak self] in

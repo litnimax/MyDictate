@@ -70,6 +70,7 @@ enum Glossary {
 }
 
 /// Частые слова и имена пользователя (для подсказки LLM).
+/// Ввод понимает и запятые, и переносы строк; хранится через «, ».
 enum Vocabulary {
     static func words() -> [String] {
         let raw = UserDefaults.standard.string(forKey: "vocabulary") ?? ""
@@ -80,5 +81,12 @@ enum Vocabulary {
             out.append(w)
         }
         return out
+    }
+
+    /// Разовая миграция: если значение было построчным — переписать через «, ».
+    static func normalizeStored() {
+        guard let raw = UserDefaults.standard.string(forKey: "vocabulary"),
+              raw.contains("\n") else { return }
+        UserDefaults.standard.set(words().joined(separator: ", "), forKey: "vocabulary")
     }
 }
