@@ -47,7 +47,13 @@ final class Transcriber {
         }
 
         let task = Task { () throws -> WhisperKit in
-            let config = WhisperKitConfig(model: wanted)
+            let config: WhisperKitConfig
+            if let folder = AppPaths.localModelFolder(wanted) {
+                // Локальная Core ML-модель (напр. podlodka-turbo) — без скачивания.
+                config = WhisperKitConfig(modelFolder: folder, download: false)
+            } else {
+                config = WhisperKitConfig(model: wanted)
+            }
             return try await WhisperKit(config)
         }
         loadTask = task

@@ -37,14 +37,21 @@ struct SettingsView: View {
         ("base", "base (самая лёгкая)"),
     ]
 
+    // Понятные названия для локальных моделей (сконвертированных вручную).
+    private let localModelTitles: [String: String] = [
+        "whisper-podlodka-turbo": "podlodka-turbo (рус, локальная)",
+    ]
+
     private var whisperOptions: [String] {
-        var list = whisperKitModels.map { $0.0 }
+        var list = AppPaths.availableLocalModels() // локальные — первыми
+        list.append(contentsOf: whisperKitModels.map { $0.0 })
         if !whisperModel.isEmpty && !list.contains(whisperModel) { list.insert(whisperModel, at: 0) }
         return list
     }
 
     private func whisperTitle(_ id: String) -> String {
-        whisperKitModels.first { $0.0 == id }?.1 ?? id
+        if let t = localModelTitles[id] { return t }
+        return whisperKitModels.first { $0.0 == id }?.1 ?? id
     }
 
     var body: some View {

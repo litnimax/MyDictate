@@ -96,6 +96,10 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
 - `build-app.sh` — сборка `.app` из SPM-вывода + подпись.
 - `create-cert.sh` — самоподписанный сертификат для стабильной подписи.
 - `fetch-whisperkit-model.sh` — прямая загрузка Core ML-модели WhisperKit с HF.
+- `convert-podlodka.sh` — конвертация bond005/whisper-podlodka-turbo в Core ML
+  (whisperkittools + 3 патча: компиляция через coremltools вместо `xcrun
+  coremlcompiler`; пропуск compute-plan; PSNR-порог декодера 35→25, иначе файнтюн
+  не сохраняется — save идёт внутри correctness-теста ПОСЛЕ ассерта).
 - `download-model.sh` — legacy (ggml для whisper.cpp), не используется.
 
 Зависимости (SPM):
@@ -137,6 +141,22 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
   варианта напрямую через curl (список берётся из HF API, файлы из `…/resolve/main/…`).
 - **Прогрев:** `Transcriber.preload()` грузит модель в фоне при старте; первая
   диктовка после запуска чуть дольше (прогрев ANE).
+
+### Локальная модель podlodka-turbo (по умолчанию)
+- **`bond005/whisper-podlodka-turbo`** — файнтюн large-v3-turbo на русский с
+  **родной пунктуацией и заглавными** (Apache 2.0). По русскому точнее стокового
+  turbo при той же скорости; тёплый прогон ~1.4с.
+- Это **не** официальная модель WhisperKit, поэтому её конвертируем в Core ML сами:
+  `scripts/convert-podlodka.sh` (whisperkittools, Python 3.11 + uv, без полного Xcode).
+  Готовая модель кладётся в `~/Library/Application Support/MyDictate/coreml-models/
+  whisper-podlodka-turbo/` (три `.mlmodelc`: MelSpectrogram, AudioEncoder, TextDecoder).
+- Приложение грузит её через `WhisperKitConfig(modelFolder:, download:false)`
+  (`AppPaths.localModelFolder`). `config.json` не нужен — WhisperKit определяет
+  вариант по размерностям модели и тянет токенайзер large-v3 онлайн.
+  `TextDecoderContextPrefill.mlmodelc` не обязателен.
+- Локальные модели появляются в выпадающем списке Настроек автоматически
+  (`AppPaths.availableLocalModels`). Первая загрузка специализирует 1.5 ГБ под ANE
+  (~5 мин, кэшируется системой навсегда).
 
 ### Почему WhisperKit, а не whisper.cpp
 - На Apple Silicon даёт GPU **и** ANE; turbo из коробки; модели уже скомпилированы
@@ -310,6 +330,14 @@ source=file); используется кнопкой «Распознать з�
   транслитерацию — тестировать русским голосом `say -v Milena`.)
 - **Пробел в конце вставки** — чтобы слова между диктовками не слипались.
 - **История 3 → 10** + колонка оригинала Whisper для оценки пользы LLM.
+- **Своя модель podlodka-turbo (Core ML).** Конвертация Whisper-файнтюна в WhisperKit
+  через whisperkittools без полного Xcode: `xcrun coremlcompiler` отсутствует →
+  пропатчили `argmaxtools` на `coremltools.compile_model` (системный CoreML).
+  Грабли: `--disable-default-tests` пропускает и сохранение моделей (save вызывается
+  внутри correctness-теста); `--generate-decoder-context-prefill-data` добавляет
+  строгий prefill-тест (PSNR>20), который падал; основной PSNR-порог декодера 35 был
+  выше реального 31 у файнтюна → понизили до 25. Бонус: podlodka ставит пунктуацию
+  сама, поэтому LLM-чистку можно отключать без потери пунктуации.
 - **Нормализация терминов в косвенных падежах.** Старый exact-match детерминированный
   словарь не ловил «Клоду» (только «Клод»). Пробовали отдать LLM: `qwen-3b`
   ненадёжна, `qwen-7b` лучше, но в полном промпте всё равно нестабильна (иногда

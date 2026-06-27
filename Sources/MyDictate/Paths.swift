@@ -9,6 +9,27 @@ enum AppPaths {
         return dir
     }
 
+    /// Папка для локальных Core ML-моделей WhisperKit (сконвертированных вручную,
+    /// напр. podlodka-turbo). Каждая модель — подпапка с *.mlmodelc.
+    static var coremlModelsDir: URL {
+        let dir = supportDir.appendingPathComponent("coreml-models", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Путь к локальной модели по имени, если она реально установлена (есть AudioEncoder).
+    static func localModelFolder(_ name: String) -> String? {
+        let dir = coremlModelsDir.appendingPathComponent(name, isDirectory: true)
+        let enc = dir.appendingPathComponent("AudioEncoder.mlmodelc")
+        return FileManager.default.fileExists(atPath: enc.path) ? dir.path : nil
+    }
+
+    /// Имена установленных локальных моделей.
+    static func availableLocalModels() -> [String] {
+        let items = (try? FileManager.default.contentsOfDirectory(atPath: coremlModelsDir.path)) ?? []
+        return items.filter { localModelFolder($0) != nil }.sorted()
+    }
+
     /// Папка для сохранённых записей диктовок (для повторного распознавания из истории).
     static var recordingsDir: URL {
         let dir = supportDir.appendingPathComponent("recordings", isDirectory: true)
