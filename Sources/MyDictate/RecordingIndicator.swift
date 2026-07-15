@@ -10,6 +10,8 @@ final class IndicatorModel: ObservableObject {
     @Published var phase: IndicatorPhase = .recording
     @Published var level: Float = 0
     @Published var paused: Bool = false
+    /// Опциональная строка прогресса для фазы распознавания (напр. «Папка: 2 из 7»).
+    @Published var progressText: String? = nil
     /// Язык вывода на эту диктовку: "auto" (как услышано) или код языка (перевод).
     @Published var outputLang: String = "auto"
 
@@ -34,6 +36,7 @@ final class IndicatorController {
     func show(phase: IndicatorPhase) {
         model.phase = phase
         model.paused = false
+        model.progressText = nil
         model.outputLang = "auto" // на каждую новую диктовку — авто
         if panel == nil { makePanel() }
         position()
@@ -42,6 +45,7 @@ final class IndicatorController {
 
     func update(level: Float) { model.level = level }
     func setPhase(_ phase: IndicatorPhase) { model.phase = phase }
+    func setProgress(_ text: String?) { model.progressText = text }
     func setPaused(_ paused: Bool) { model.paused = paused }
     func hide() { panel?.orderOut(nil) }
 
@@ -89,7 +93,7 @@ private struct IndicatorView: View {
                 ProgressView()
                     .controlSize(.small)
                     .colorScheme(.dark)
-                Text("Распознаю…")
+                Text(model.progressText ?? "Распознаю…")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.white)
             }

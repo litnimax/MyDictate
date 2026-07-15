@@ -93,6 +93,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if state == .transcribing { file.isEnabled = false }
         menu.addItem(file)
 
+        let folder = NSMenuItem(title: "Транскрибировать папку…", action: #selector(pickAndTranscribeFolder), keyEquivalent: "")
+        folder.target = self
+        if state == .transcribing { folder.isEnabled = false }
+        menu.addItem(folder)
+
         menu.addItem(.separator())
 
         let settings = NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ",")
@@ -395,5 +400,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    // MARK: - Транскрибация папки (пакетно)
+
+    /// Выбор папки: все аудиофайлы верхнего уровня распознаются, рядом с каждым
+    /// пишется одноимённый .txt с транскриптом. В историю не сохраняется.
+    @objc private func pickAndTranscribeFolder() {
+        guard state != .transcribing else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Выберите папку с аудиофайлами"
+        panel.message = "Все аудиофайлы в папке будут распознаны; рядом с каждым появится .txt с транскриптом."
+        panel.prompt = "Транскрибировать"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+
+        let audioFiles = Self.audioFiles(in: dir)
+        guard !audioFiles.isEmpty else {
+            alert(title: "Аудио не найдено",
+                  message: "В выбранной папке нет распознаваемых аудиофайлов (проверяется верхний уровень).")
+            return
+        }
+
+        state = .transcribing
+        indicator.show(phase: .transcribing)
+        rebuildMenu()
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            var done = 0, failed = 0
+            for (idx, url) in audioFiles.enumerated() {
+                await MainActor.run { self.indicator.setProgress("Папка: \(idx + 1) из \(audioFiles.count)") }
+                do {
+                    let raw = try await self.transcriber.transcribeFile(url)
+                    let text = Glossary.apply(await LLMPostProcessor.process(raw))
+                    let out = url.deletingPathExtension().appendingPathExtension("txt")
+                    try text.write(to: out, atomically: true, encoding: .utf8)
+                    done += 1
+                } catch {
+                    failed += 1
+                }
+            }
+            let okCount = done, failCount = failed
+            await MainActor.run {
+                self.indicator.setProgress(nil)
+                self.indicator.hide()
+                self.state = .idle
+                self.rebuildMenu()
+                let msg = failCount == 0
+                    ? "Распознано файлов: \(okCount). Рядом с каждым сохранён .txt."
+                    : "Распознано: \(okCount), с ошибкой: \(failCount). Рядом с успешными сохранён .txt."
+                self.alert(title: "Готово", message: msg)
+            }
+        }
+    }
+
+    /// Аудиофайлы верхнего уровня папки — по типу содержимого (UTType), не только
+    /// по расширению; отсортированы по имени.
+    private static func audioFiles(in dir: URL) -> [URL] {
+        let keys: Set<URLResourceKey> = [.contentTypeKey, .isRegularFileKey]
+        let items = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles])) ?? []
+        return items.filter { url in
+            guard let v = try? url.resourceValues(forKeys: keys), v.isRegularFile == true else { return false }
+            return v.contentType?.conforms(to: .audio) == true
+        }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
     }
 }
