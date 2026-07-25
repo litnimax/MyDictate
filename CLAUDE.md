@@ -51,6 +51,8 @@ open MyDictate.app
 
 - WhisperKit качает Core ML-модели в `~/Documents/huggingface/models/argmaxinc/…`.
 - Встроенный загрузчик иногда виснет (xet HF) → `scripts/fetch-whisperkit-model.sh`.
+- Альтернативный движок GigaAM-v3 RNNT (MLX, Python-воркер):
+  `scripts/setup-gigaam-mlx.sh` один раз, дальше выбирается в Настройках.
 
 ## Заметки для агента
 

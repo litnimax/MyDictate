@@ -42,8 +42,14 @@ struct SettingsView: View {
         "whisper-podlodka-turbo": "podlodka-turbo (рус, локальная)",
     ]
 
+    // Альтернативные движки (не WhisperKit).
+    private let extraModels: [(String, String)] = [
+        (GigaAMTranscriber.modelID, "GigaAM-v3 rnnt (рус+англ, MLX)"),
+    ]
+
     private var whisperOptions: [String] {
         var list = AppPaths.availableLocalModels() // локальные — первыми
+        list.append(contentsOf: extraModels.map { $0.0 })
         list.append(contentsOf: whisperKitModels.map { $0.0 })
         if !whisperModel.isEmpty && !list.contains(whisperModel) { list.insert(whisperModel, at: 0) }
         return list
@@ -51,6 +57,7 @@ struct SettingsView: View {
 
     private func whisperTitle(_ id: String) -> String {
         if let t = localModelTitles[id] { return t }
+        if let t = extraModels.first(where: { $0.0 == id })?.1 { return t }
         return whisperKitModels.first { $0.0 == id }?.1 ?? id
     }
 
@@ -67,7 +74,7 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Распознавание (WhisperKit · GPU + Neural Engine)") {
+            Section("Распознавание (локальное)") {
                 Picker("Модель:", selection: $whisperModel) {
                     ForEach(whisperOptions, id: \.self) { name in
                         Text(whisperTitle(name)).tag(name)
@@ -76,8 +83,18 @@ struct SettingsView: View {
                 .onChange(of: whisperModel) { _ in
                     NotificationCenter.default.post(name: .settingsChanged, object: nil)
                 }
-                Text("Модель скачивается автоматически при первом выборе (нужен интернет). Считает на GPU и Neural Engine.")
-                    .font(.caption2).foregroundColor(.secondary)
+                if whisperModel == GigaAMTranscriber.modelID {
+                    if GigaAMTranscriber.isInstalled {
+                        Text("GigaAM-v3 (Сбер) на MLX: русский + английский, пунктуация из коробки, перевод и выбор языка не поддерживаются.")
+                            .font(.caption2).foregroundColor(.secondary)
+                    } else {
+                        Text("⚠️ Движок не установлен. Запустите из папки проекта: ./scripts/setup-gigaam-mlx.sh")
+                            .font(.caption2).foregroundColor(.orange)
+                    }
+                } else {
+                    Text("Модель скачивается автоматически при первом выборе (нужен интернет). Считает на GPU и Neural Engine.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
             }
 
             Section("Частые слова и имена (подсказка распознаванию)") {

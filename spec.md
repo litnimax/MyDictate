@@ -40,7 +40,8 @@
    - эквалайзер уровня звука;
    - кнопки **пауза/продолжить**, **отмена (✕)**, **язык вывода** (🌐/EN/RU).
 4. **Распознавание** — WhisperKit (Core ML), модель `large-v3-turbo` по умолчанию,
-   на GPU + Apple Neural Engine.
+   на GPU + Apple Neural Engine. Альтернативный движок — **GigaAM-v3 RNNT (MLX)**:
+   выбирается в том же списке моделей, работает через Python-воркер (см. §5).
 5. **Автовставка** распознанного текста в активное поле (буфер обмена + эмуляция
    ⌘V), с восстановлением прежнего буфера и **добавлением пробела в конце**.
 6. **История** последних 10 транскриптов (хранится между запусками): итоговый
@@ -87,7 +88,8 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
 | `AppDelegate.swift` | ядро | Меню-бар, конечный автомат, окна, права, оркестрация пайплайна. |
 | `Shortcuts.swift` | ядро | `TriggerMonitor` — глобальный правый ⌥ через `NSEvent` `.flagsChanged`. |
 | `AudioRecorder.swift` | ядро | `AVAudioEngine`: захват, ресемпл в 16 кГц mono Float32, уровень, пауза. |
-| `Transcriber.swift` | ядро | WhisperKit: загрузка модели, транскрибация массива/файла, (опц.) Whisper-перевод. |
+| `Transcriber.swift` | ядро | Фасад распознавания: WhisperKit (загрузка модели, транскрибация массива/файла, опц. Whisper-перевод) + маршрутизация на GigaAM по выбранной модели. |
+| `GigaAMTranscriber.swift` | ядро (опц. движок) | GigaAM-v3 RNNT (MLX): управление постоянным Python-воркером, обмен JSON-строками через stdin/stdout. |
 | `TextInjector.swift` | ядро | Вставка через буфер + CGEvent ⌘V, пробел в конце. |
 | `RecordingIndicator.swift` | ядро | HUD-панель (NSPanel) + SwiftUI: точка, эквалайзер, кнопки. |
 | `TranscriptStore.swift` | ядро | История (10 шт., итог + оригинал + аудио), персист в UserDefaults, чистка WAV при вытеснении. |
@@ -106,6 +108,12 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
   (whisperkittools + 3 патча: компиляция через coremltools вместо `xcrun
   coremlcompiler`; пропуск compute-plan; PSNR-порог декодера 35→25, иначе файнтюн
   не сохраняется — save идёт внутри correctness-теста ПОСЛЕ ассерта).
+- `setup-gigaam-mlx.sh` — установка движка GigaAM: venv (uv, Python 3.12) +
+  пакет `gigaam-mlx` + копия воркера в `~/Library/Application Support/MyDictate/
+  gigaam-mlx/`, предзагрузка модели RNNT (~0.9 ГБ). Нюанс: `numba>=0.60`
+  пинится явно, иначе резолвер uv откатывается на numba 0.53/llvmlite 0.36,
+  которые не собираются под Python 3.12.
+- `gigaam-worker.py` — исходник воркера GigaAM (устанавливается setup-скриптом).
 - `download-model.sh` — legacy (ggml для whisper.cpp), не используется.
 
 Зависимости (SPM):
@@ -163,6 +171,33 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
 - Локальные модели появляются в выпадающем списке Настроек автоматически
   (`AppPaths.availableLocalModels`). Первая загрузка специализирует 1.5 ГБ под ANE
   (~5 мин, кэшируется системой навсегда).
+
+### Альтернативный движок: GigaAM-v3 RNNT (MLX)
+- **`aystream/GigaAM-v3-e2e-rnnt-mlx`** — MLX-порт GigaAM-v3 Сбера (Conformer
+  220M + RNN-T, MIT): русский + английский, **пунктуация и заглавные из
+  коробки** (e2e), ~77× реального времени на M2 Max. По русскому обычно точнее
+  Whisper-моделей.
+- Модель питоновская (пакет `gigaam-mlx`), в Swift напрямую не исполняется,
+  поэтому интегрирована **постоянным Python-воркером**: `GigaAMTranscriber`
+  (actor) держит процесс `venv/bin/python3 worker.py`; протокол — JSON-строки
+  (`{"path": wav}` → `{"text"|"error": …}`, на старте `{"ready": true}`).
+  Запросы сериализуются цепочкой Task (актор реентерабелен); stderr копится
+  для диагностики; упавший воркер перезапускается на следующем запросе.
+- Установка: `scripts/setup-gigaam-mlx.sh` (uv + venv в `~/Library/Application
+  Support/MyDictate/gigaam-mlx/`, веса — в кэше HF `~/.cache/huggingface`).
+  Если движок выбран, но не установлен, — понятная ошибка и подсказка в
+  Настройках. Для HF ставится `HF_HUB_DISABLE_XET=1` (xet иногда виснет, §5).
+- **ffmpeg не нужен** (в отличие от CLI `gigaam-mlx`): диктовка пишется в WAV
+  16 кГц самим приложением (`AudioFile.writeWAV`), файлы декодирует
+  `AudioProcessor.loadAudioAsFloatArray` из WhisperKit (AVFoundation). Воркер
+  читает WAV модулем `wave`, длинные записи режет по тишине (`split_audio`).
+- Ограничения: перевода нет (встроенный Whisper-перевод →en недоступен, см.
+  §7); настройка «Язык» игнорируется (модель сама рус/англ). Прогрев тот же
+  (`Transcriber.preload()` → старт воркера, ~5 с). При переключении движков
+  память освобождается: GigaAM → `pipe = nil` (Core ML), WhisperKit →
+  `gigaam.shutdown()` (~1 ГБ воркера). После каждого запроса воркер вызывает
+  `mx.clear_cache()`: веса остаются загруженными, а временные Metal-буферы не
+  накапливаются в постоянном процессе до системного memory limit.
 
 ### Почему WhisperKit, а не whisper.cpp
 - На Apple Silicon даёт GPU **и** ANE; turbo из коробки; модели уже скомпилированы
@@ -223,6 +258,8 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
   - любой язык при включённом LLM → `LLMPostProcessor.process(raw, translateTo: lang)`
     (инструкция перевода добавляется в системный промпт).
 - Перевод в не-английский требует блока A (Whisper умеет только →en).
+- С движком GigaAM встроенного перевода нет вовсе: выбор `en` без LLM просто
+  игнорируется (вставляется распознанный текст как есть).
 
 **Как вырезать блок B:** убрать `outputLang`/`cycleLang`/`LangButton`, параметр
 `translateTo` и `translateToEnglish`. Останется распознавание на языке речи.
@@ -296,7 +333,7 @@ open MyDictate.app
 | Ключ | Значение | Блок |
 |------|----------|------|
 | `language` | язык Whisper: `auto`/`ru`/`en`/`uk`/`pl`/`de`/`es`/`fr` | ядро |
-| `whisperKitModel` | имя модели WhisperKit (по умолч. `large-v3-v20240930_turbo`) | ядро |
+| `whisperKitModel` | имя модели WhisperKit (по умолч. `large-v3-v20240930_turbo`); спец-значение `gigaam-v3-rnnt-mlx` переключает на движок GigaAM | ядро |
 | `glossary` | правила замен, по строке `что => на_что` | ядро |
 | `vocabulary` | частые слова/имена (запятая/новая строка) | ядро |
 | `transcripts` | история (JSON `[Transcript]`, 10 шт.) | ядро |
@@ -350,6 +387,22 @@ source=file); используется кнопкой «Распознать з�
   строгий prefill-тест (PSNR>20), который падал; основной PSNR-порог декодера 35 был
   выше реального 31 у файнтюна → понизили до 25. Бонус: podlodka ставит пунктуацию
   сама, поэтому LLM-чистку можно отключать без потери пунктуации.
+- **Движок GigaAM-v3 RNNT (MLX) через Python-воркер.** Модель
+  `aystream/GigaAM-v3-e2e-rnnt-mlx` существует только под Python/MLX — портировать
+  Conformer+RNN-T на mlx-swift дорого и хрупко. Вместо этого узкий интерфейс
+  `transcribe(frames) → text` (§13) реализован сайдкар-процессом: постоянный
+  воркер с JSON-протоколом, WAV через файл. Грабли: (1) uv под Python 3.12
+  резолвил `numba 0.53`/`llvmlite 0.36` (не собираются) — нужен явный пин
+  `numba>=0.60`; (2) ffmpeg-зависимость пакета обойдена чтением WAV напрямую
+  (`wave`) и декодированием файлов через WhisperKit `AudioProcessor`; (3) MLX
+  кэширует освобождённые Metal-буферы вплоть до системного memory limit — в
+  постоянном воркере без `mx.clear_cache()` после каждого запроса footprint за
+  несколько дней вырос до ~24 ГБ (почти целиком `IOAccelerator (graphics)`).
+- **UserDefaults у небандлированного бинаря — другой домен.** Debug-бинарь из
+  `swift build` (без Info.plist) читает настройки из домена `MyDictate`, а не
+  `com.mydictate.app` — `defaults write com.mydictate.app …` на него не влияет
+  (селфтест молча берёт модель по умолчанию). Для отладки `--selftest` либо
+  запускать бинарь из бандла (как в CLAUDE.md), либо писать в домен `MyDictate`.
 - **Нормализация терминов в косвенных падежах.** Старый exact-match детерминированный
   словарь не ловил «Клоду» (только «Клод»). Пробовали отдать LLM: `qwen-3b`
   ненадёжна, `qwen-7b` лучше, но в полном промпте всё равно нестабильна (иногда
