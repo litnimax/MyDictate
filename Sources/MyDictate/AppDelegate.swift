@@ -84,8 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let history = NSMenuItem(title: "История…", action: #selector(openHistory), keyEquivalent: "h")
-        history.target = self
+        let history = NSMenuItem(title: "История", action: nil, keyEquivalent: "")
+        history.submenu = historyMenu()
         menu.addItem(history)
 
         let file = NSMenuItem(title: "Транскрибировать файл…", action: #selector(pickAndTranscribeFile), keyEquivalent: "o")
@@ -109,6 +109,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+    }
+
+    private func historyMenu() -> NSMenu {
+        let menu = NSMenu()
+        if store.items.isEmpty {
+            let empty = NSMenuItem(title: "Пока пусто", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return menu
+        }
+
+        for transcript in store.items {
+            let item = NSMenuItem(
+                title: historyMenuTitle(for: transcript.text),
+                action: #selector(copyTranscriptFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = transcript.text
+            item.toolTip = transcript.text
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private func historyMenuTitle(for text: String) -> String {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        let preview = words.prefix(8).joined(separator: " ")
+        return words.count > 8 ? preview + "…" : preview
+    }
+
+    @objc private func copyTranscriptFromMenu(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     @objc private func menuToggle() { toggle() }
@@ -189,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         NSSound.beep()
                     } else {
                         self.store.add(text, raw: raw, source: .dictation, audioFile: savedAudio) // итог + оригинал + аудио
+                        self.rebuildMenu()
                         if self.ensureAccessibility() {
                             TextInjector.insert(text)
                         } else {
@@ -336,7 +372,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.state = .idle
                     self.rebuildMenu()
                     if text.isEmpty { NSSound.beep() }
-                    else { self.store.update(id: item.id, text: text, raw: raw) }
+                    else {
+                        self.store.update(id: item.id, text: text, raw: raw)
+                        self.rebuildMenu()
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -388,6 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.alert(title: "Пусто", message: "В файле не распознано речи.")
                     } else {
                         self.store.add(text, raw: raw, source: .file, fileName: url.lastPathComponent, audioFile: url.path)
+                        self.rebuildMenu()
                         self.openHistory() // показываем результат
                     }
                 }
