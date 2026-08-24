@@ -7,6 +7,7 @@ extension Notification.Name {
 struct SettingsView: View {
     @AppStorage("language") private var language: String = "auto"
     @AppStorage("whisperKitModel") private var whisperModel: String = Transcriber.defaultModel
+    @AppStorage(AudioRecorder.inputDeviceUIDKey) private var audioInputDeviceUID: String = ""
 
     @AppStorage("llmEnabled") private var llmEnabled: Bool = false
     @AppStorage("llmBaseURL") private var llmBaseURL: String = LLMPostProcessor.defaultBaseURL
@@ -17,6 +18,7 @@ struct SettingsView: View {
 
     @State private var llmModels: [String] = []
     @State private var serverStatus: String = ""
+    @State private var audioInputDevices: [AudioInputDevice] = []
 
     private let languages: [(String, String)] = [
         ("auto", "Авто-определение"),
@@ -75,6 +77,12 @@ struct SettingsView: View {
             }
 
             Section("Распознавание (локальное)") {
+                Picker("Устройство записи:", selection: $audioInputDeviceUID) {
+                    Text("Системное устройство").tag("")
+                    ForEach(audioInputDevices) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                }
                 Picker("Модель:", selection: $whisperModel) {
                     ForEach(whisperOptions, id: \.self) { name in
                         Text(whisperTitle(name)).tag(name)
@@ -155,7 +163,10 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 430, height: 760)
-        .onAppear { refresh(after: 0) }
+        .onAppear {
+            audioInputDevices = AudioRecorder.availableInputDevices()
+            refresh(after: 0)
+        }
     }
 
     private var modelOptions: [String] {
