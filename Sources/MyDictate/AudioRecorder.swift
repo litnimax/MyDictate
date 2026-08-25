@@ -1,34 +1,28 @@
 import AVFoundation
-import CoreAudio
 import AudioToolbox
+import CoreAudio
 
 struct AudioInputDevice: Identifiable, Hashable {
-    let id: AudioDeviceID
+    var id: String { uid }
     let uid: String
     let name: String
 }
 
-/// Захватывает аудио с микрофона и приводит его к 16 кГц mono Float32 — формату, который ждёт whisper.cpp.
+/// Захватывает аудио с выбранного Core Audio-устройства в 16 кГц mono Float32.
 final class AudioRecorder {
     static let inputDeviceUIDKey = "audioInputDeviceUID"
 
-    private let engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
-    private let targetFormat: AVAudioFormat
     private let lock = NSLock()
+    private var audioUnit: AudioUnit?
+    private var renderBuffer: UnsafeMutablePointer<Float>?
+    private let renderBufferCapacity: UInt32 = 16_384
+    private var captureSampleRate: Double = 16_000
     private var _samples: [Float] = []
     private var _paused = false
 
     /// Колбэк с уровнем громкости (RMS, 0...1) для индикатора. Вызывается на главном потоке.
     var onLevel: ((Float) -> Void)?
     private(set) var isRecording = false
-
-    init() {
-        targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                     sampleRate: 16_000,
-                                     channels: 1,
-                                     interleaved: false)!
-    }
 
     // MARK: - Разрешение на микрофон
 
@@ -50,20 +44,125 @@ final class AudioRecorder {
     func start() throws {
         lock.lock(); _samples.removeAll(); _paused = false; lock.unlock()
 
-        let input = engine.inputNode
-        try selectConfiguredInputDevice(on: input)
-        let inputFormat = input.outputFormat(forBus: 0)
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-
-        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
-            self?.process(buffer: buffer, inputFormat: inputFormat)
+        var description = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &description) else {
+            throw RecordingError.cannotCreateAudioUnit
         }
-        engine.prepare()
-        try engine.start()
-        isRecording = true
+
+        var unit: AudioUnit?
+        try check(AudioComponentInstanceNew(component, &unit))
+        guard let unit else { throw RecordingError.cannotCreateAudioUnit }
+
+        do {
+            var enabled: UInt32 = 1
+            try check(AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1,
+                &enabled, UInt32(MemoryLayout<UInt32>.size)
+            ))
+            var disabled: UInt32 = 0
+            try check(AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0,
+                &disabled, UInt32(MemoryLayout<UInt32>.size)
+            ))
+
+            var deviceID = try configuredInputDeviceID()
+            captureSampleRate = try Self.nominalSampleRate(for: deviceID)
+            try check(AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size)
+            ))
+
+            var format = AudioStreamBasicDescription(
+                mSampleRate: captureSampleRate,
+                mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagsNativeFloatPacked,
+                mBytesPerPacket: UInt32(MemoryLayout<Float>.size),
+                mFramesPerPacket: 1,
+                mBytesPerFrame: UInt32(MemoryLayout<Float>.size),
+                mChannelsPerFrame: 1,
+                mBitsPerChannel: 32,
+                mReserved: 0
+            )
+            try check(AudioUnitSetProperty(
+                unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1,
+                &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+            ))
+
+            var callback = AURenderCallbackStruct(
+                inputProc: { refCon, flags, timestamp, _, frameCount, _ in
+                    return Unmanaged<AudioRecorder>.fromOpaque(refCon).takeUnretainedValue()
+                        .render(flags: flags, timestamp: timestamp, frameCount: frameCount)
+                },
+                inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+            )
+            try check(AudioUnitSetProperty(
+                unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+                &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+            ))
+
+            renderBuffer = .allocate(capacity: Int(renderBufferCapacity))
+            audioUnit = unit
+            try check(AudioUnitInitialize(unit))
+            try check(AudioOutputUnitStart(unit))
+            isRecording = true
+        } catch {
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+            renderBuffer?.deallocate()
+            renderBuffer = nil
+            audioUnit = nil
+            throw error
+        }
     }
 
+    /// Останавливает запись и возвращает накопленные сэмплы (16 кГц mono).
+    func stop() -> [Float] {
+        guard isRecording else { return currentSamples }
+        isRecording = false
+        if let unit = audioUnit {
+            AudioOutputUnitStop(unit)
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        audioUnit = nil
+        renderBuffer?.deallocate()
+        renderBuffer = nil
+        return resampleTo16k(currentSamples)
+    }
+
+    // MARK: - Устройства
+
     static func availableInputDevices() -> [AudioInputDevice] {
+        allDeviceIDs().compactMap { id in
+            guard hasInputStreams(id),
+                  let uid = stringProperty(kAudioDevicePropertyDeviceUID, for: id),
+                  let name = stringProperty(kAudioObjectPropertyName, for: id) else { return nil }
+            return AudioInputDevice(uid: uid, name: name)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func configuredInputDeviceID() throws -> AudioDeviceID {
+        let savedUID = UserDefaults.standard.string(forKey: Self.inputDeviceUIDKey) ?? ""
+        if savedUID.isEmpty {
+            guard let id = Self.defaultInputDeviceID() else { throw RecordingError.noInputDevice }
+            return id
+        }
+        guard let id = Self.allDeviceIDs().first(where: {
+            Self.stringProperty(kAudioDevicePropertyDeviceUID, for: $0) == savedUID
+        }) else {
+            throw RecordingError.selectedDeviceUnavailable
+        }
+        return id
+    }
+
+    private static func allDeviceIDs() -> [AudioDeviceID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -73,48 +172,11 @@ final class AudioRecorder {
         guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else {
             return []
         }
-
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        var ids = [AudioDeviceID](repeating: 0, count: count)
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &ids) == noErr else {
             return []
         }
-
-        return ids.compactMap { id in
-            guard hasInputStreams(id),
-                  let uid = stringProperty(kAudioDevicePropertyDeviceUID, for: id),
-                  let name = stringProperty(kAudioObjectPropertyName, for: id) else { return nil }
-            return AudioInputDevice(id: id, uid: uid, name: name)
-        }
-        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
-
-    private func selectConfiguredInputDevice(on input: AVAudioInputNode) throws {
-        let savedUID = UserDefaults.standard.string(forKey: Self.inputDeviceUIDKey) ?? ""
-        let deviceID: AudioDeviceID
-        if savedUID.isEmpty {
-            guard let defaultID = Self.defaultInputDeviceID() else {
-                throw RecordingError.noInputDevice
-            }
-            deviceID = defaultID
-        } else {
-            guard let selected = Self.availableInputDevices().first(where: { $0.uid == savedUID }) else {
-                throw RecordingError.selectedDeviceUnavailable
-            }
-            deviceID = selected.id
-        }
-
-        guard let audioUnit = input.audioUnit else { throw RecordingError.noAudioUnit }
-        var mutableID = deviceID
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &mutableID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard status == noErr else { throw RecordingError.cannotSelectDevice(status) }
+        return ids
     }
 
     private static func defaultInputDeviceID() -> AudioDeviceID? {
@@ -140,6 +202,19 @@ final class AudioRecorder {
         return AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr && size > 0
     }
 
+    private static func nominalSampleRate(for id: AudioDeviceID) throws -> Double {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var sampleRate: Double = 0
+        var size = UInt32(MemoryLayout<Double>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &sampleRate) == noErr,
+              sampleRate > 0 else { throw RecordingError.cannotReadDeviceFormat }
+        return sampleRate
+    }
+
     private static func stringProperty(_ selector: AudioObjectPropertySelector, for id: AudioDeviceID) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
@@ -152,38 +227,88 @@ final class AudioRecorder {
         return value?.takeUnretainedValue() as String?
     }
 
-    private enum RecordingError: LocalizedError {
-        case noInputDevice
-        case selectedDeviceUnavailable
-        case noAudioUnit
-        case cannotSelectDevice(OSStatus)
+    // MARK: - Получение сэмплов
 
-        var errorDescription: String? {
-            switch self {
-            case .noInputDevice:
-                return "Системное устройство записи не найдено."
-            case .selectedDeviceUnavailable:
-                return "Выбранное устройство записи недоступно. Подключите его или выберите другое в Настройках."
-            case .noAudioUnit:
-                return "Не удалось инициализировать аудиовход."
-            case .cannotSelectDevice(let status):
-                return "Не удалось выбрать устройство записи (ошибка Core Audio \(status))."
-            }
+    private func render(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timestamp: UnsafePointer<AudioTimeStamp>,
+        frameCount: UInt32
+    ) -> OSStatus {
+        guard let unit = audioUnit, let renderBuffer, frameCount <= renderBufferCapacity else {
+            return kAudio_ParamError
         }
-    }
 
-    /// Останавливает запись и возвращает накопленные сэмплы (16 кГц mono).
-    func stop() -> [Float] {
-        guard isRecording else { return currentSamples }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        isRecording = false
-        return currentSamples
+        var bufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: 1,
+                mDataByteSize: frameCount * UInt32(MemoryLayout<Float>.size),
+                mData: renderBuffer
+            )
+        )
+        let status = AudioUnitRender(unit, flags, timestamp, 1, frameCount, &bufferList)
+        guard status == noErr else { return status }
+
+        lock.lock()
+        if _paused {
+            lock.unlock()
+            return noErr
+        }
+        _samples.append(contentsOf: UnsafeBufferPointer(start: renderBuffer, count: Int(frameCount)))
+        lock.unlock()
+
+        var sumSq: Float = 0
+        for i in 0..<Int(frameCount) { sumSq += renderBuffer[i] * renderBuffer[i] }
+        let level = min(1.0, sqrt(sumSq / Float(frameCount)) * 4.0)
+        DispatchQueue.main.async { [weak self] in self?.onLevel?(level) }
+        return noErr
     }
 
     private var currentSamples: [Float] {
         lock.lock(); defer { lock.unlock() }
         return _samples
+    }
+
+    private func resampleTo16k(_ samples: [Float]) -> [Float] {
+        guard !samples.isEmpty, abs(captureSampleRate - 16_000) >= 1,
+              let inputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: captureSampleRate,
+                channels: 1,
+                interleaved: false
+              ),
+              let outputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: false
+              ),
+              let converter = AVAudioConverter(from: inputFormat, to: outputFormat),
+              let input = AVAudioPCMBuffer(
+                pcmFormat: inputFormat,
+                frameCapacity: AVAudioFrameCount(samples.count)
+              ) else { return samples }
+
+        input.frameLength = input.frameCapacity
+        samples.withUnsafeBufferPointer { source in
+            input.floatChannelData?[0].update(from: source.baseAddress!, count: samples.count)
+        }
+
+        let capacity = AVAudioFrameCount(Double(samples.count) * 16_000 / captureSampleRate + 32)
+        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return samples }
+        var supplied = false
+        var error: NSError?
+        converter.convert(to: output, error: &error) { _, status in
+            if supplied {
+                status.pointee = .endOfStream
+                return nil
+            }
+            supplied = true
+            status.pointee = .haveData
+            return input
+        }
+        guard error == nil, let channel = output.floatChannelData else { return samples }
+        return Array(UnsafeBufferPointer(start: channel[0], count: Int(output.frameLength)))
     }
 
     var isPaused: Bool {
@@ -198,40 +323,30 @@ final class AudioRecorder {
         }
     }
 
-    // MARK: - Конвертация
+    private func check(_ status: OSStatus) throws {
+        guard status == noErr else { throw RecordingError.coreAudio(status) }
+    }
 
-    private func process(buffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat) {
-        if isPaused { return } // на паузе сэмплы не накапливаем
-        guard let converter = converter else { return }
-        let ratio = targetFormat.sampleRate / inputFormat.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 16)
-        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+    private enum RecordingError: LocalizedError {
+        case noInputDevice
+        case selectedDeviceUnavailable
+        case cannotCreateAudioUnit
+        case cannotReadDeviceFormat
+        case coreAudio(OSStatus)
 
-        var fed = false
-        var err: NSError?
-        converter.convert(to: out, error: &err) { _, status in
-            if fed {
-                status.pointee = .noDataNow
-                return nil
+        var errorDescription: String? {
+            switch self {
+            case .noInputDevice:
+                return "Системное устройство записи не найдено."
+            case .selectedDeviceUnavailable:
+                return "Выбранное устройство записи недоступно. Подключите его или выберите другое в Настройках."
+            case .cannotCreateAudioUnit:
+                return "Не удалось создать аудиовход."
+            case .cannotReadDeviceFormat:
+                return "Не удалось определить частоту устройства записи."
+            case .coreAudio(let status):
+                return "Не удалось настроить устройство записи (ошибка Core Audio \(status))."
             }
-            fed = true
-            status.pointee = .haveData
-            return buffer
         }
-        if err != nil { return }
-
-        guard let channel = out.floatChannelData, out.frameLength > 0 else { return }
-        let n = Int(out.frameLength)
-        let ptr = channel[0]
-
-        var sumSq: Float = 0
-        for i in 0..<n { sumSq += ptr[i] * ptr[i] }
-
-        lock.lock()
-        _samples.append(contentsOf: UnsafeBufferPointer(start: ptr, count: n))
-        lock.unlock()
-
-        let level = min(1.0, sqrt(sumSq / Float(n)) * 4.0) // лёгкое усиление для наглядности
-        DispatchQueue.main.async { [weak self] in self?.onLevel?(level) }
     }
 }
