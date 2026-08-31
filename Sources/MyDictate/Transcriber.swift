@@ -57,11 +57,17 @@ final class Transcriber {
 
         let task = Task { () throws -> WhisperKit in
             let config: WhisperKitConfig
+            let tokenizerFolder = AppPaths.supportDir
+                .appendingPathComponent("tokenizers", isDirectory: true)
             if let folder = AppPaths.localModelFolder(wanted) {
                 // Локальная Core ML-модель (напр. podlodka-turbo) — без скачивания.
-                config = WhisperKitConfig(modelFolder: folder, download: false)
+                config = WhisperKitConfig(
+                    modelFolder: folder,
+                    tokenizerFolder: tokenizerFolder,
+                    download: false
+                )
             } else {
-                config = WhisperKitConfig(model: wanted)
+                config = WhisperKitConfig(model: wanted, tokenizerFolder: tokenizerFolder)
             }
             return try await WhisperKit(config)
         }

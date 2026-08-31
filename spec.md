@@ -156,6 +156,10 @@ Swift Package, исполняемый таргет `MyDictate`. Файлы `Sour
   Hugging Face (`argmaxinc/whisperkit-coreml`) в
   `~/Documents/huggingface/models/argmaxinc/whisperkit-coreml/<variant>`. Веса —
   это данные (не код), поэтому докачка допустима и для App Store.
+- **Токенайзеры:** отдельный кэш Hugging Face хранится в `~/Library/Application
+  Support/MyDictate/tokenizers/`, а не в `~/Documents`. Это не требует у приложения
+  доступа к пользовательским документам и не ломается при сбросе разрешения Files
+  & Folders после обновления macOS.
 - **Важный нюанс:** встроенный загрузчик WhisperKit иногда **зависает** на
   xet-бэкенде HF. Обходной путь — `scripts/fetch-whisperkit-model.sh`: тянет файлы
   варианта напрямую через curl (список берётся из HF API, файлы из `…/resolve/main/…`).
